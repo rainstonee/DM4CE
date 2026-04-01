@@ -18,6 +18,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from loaders import *
 from torch.utils.data import DataLoader
 from typing import Union
+from karras_diffusion import mean_flat, append_dims, get_weightings
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -249,11 +250,7 @@ class ConsistencyLoss:
         )
         # total_training_steps=total_training_steps,
 
-    def mean_flat(self,tensor):
-        """
-        Take the mean over all non-batch dimensions.
-        """
-        return tensor.mean(dim=list(range(1, len(tensor.shape))))
+
 
     def get_scalings(self, sigma):
         c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
@@ -273,48 +270,30 @@ class ConsistencyLoss:
         c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
         return c_skip, c_out, c_in
 
-    def get_weightings(self, weight_schedule, snrs, sigma_data):
-        if weight_schedule == "snr":
-            weightings = snrs
-        elif weight_schedule == "snr+1":
-            weightings = snrs + 1
-        elif weight_schedule == "karras":
-            weightings = snrs + 1.0 / sigma_data**2
-        elif weight_schedule == "truncated-snr":
-            weightings = torch.clamp(snrs, min=1.0)
-        elif weight_schedule == "uniform":
-            weightings = torch.ones_like(snrs)
-        else:
-            raise NotImplementedError()
-        return weightings
 
-    def append_dims(self, x, target_dims):
-        """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
-        dims_to_append = target_dims - x.ndim
-        if dims_to_append < 0:
-            raise ValueError(
-                f"input has {x.ndim} dims but target_dims is {target_dims}, which is less"
-            )
-        return x[(...,) + (None,) * dims_to_append]
+
+    
 
     def denoise(self, model, x_t, sigmas, **model_kwargs):
         import torch.distributed as dist
 
         if not self.distillation:
             c_skip, c_out, c_in = [
-                self.append_dims(x, x_t.ndim) for x in self.get_scalings(sigmas)
+                append_dims(x, x_t.ndim) for x in self.get_scalings(sigmas)
             ]
         else:
             c_skip, c_out, c_in = [
-                self.append_dims(x, x_t.ndim)
+                append_dims(x, x_t.ndim)
                 for x in self.get_scalings_for_boundary_condition(sigmas)
             ]
         rescaled_t = 1000 * 0.25 * torch.log(sigmas + 1e-44)
         model_output = model(c_in * x_t, rescaled_t, **model_kwargs)
         denoised = c_out * model_output + c_skip * x_t
         return model_output, denoised
+    
     def get_snr(self, sigmas):
         return sigmas**-2
+
 
     def __call__(self, model, batch, global_step, model_kwargs=None):
         device = next(model.parameters()).device
@@ -354,15 +333,15 @@ class ConsistencyLoss:
             else:
                 denoiser = teacher_denoise_fn(x, t)
 
-            d = (x - denoiser) / self.append_dims(t, dims)
-            samples = x + d * self.append_dims(next_t - t, dims)
+            d = (x - denoiser) / append_dims(t, dims)
+            samples = x + d * append_dims(next_t - t, dims)
             if self.teacher_model is None:
                 denoiser = x0
             else:
                 denoiser = teacher_denoise_fn(samples, next_t)
 
-            next_d = (samples - denoiser) / self.append_dims(next_t, dims)
-            samples = x + (d + next_d) * self.append_dims((next_t - t) / 2, dims)
+            next_d = (samples - denoiser) / append_dims(next_t, dims)
+            samples = x + (d + next_d) * append_dims((next_t - t) / 2, dims)
 
             return samples
 
@@ -373,8 +352,8 @@ class ConsistencyLoss:
                 denoiser = x0
             else:
                 denoiser = teacher_denoise_fn(x, t)
-            d = (x - denoiser) / self.append_dims(t, dims)
-            samples = x + d * self.append_dims(next_t - t, dims)
+            d = (x - denoiser) / append_dims(t, dims)
+            samples = x + d * append_dims(next_t - t, dims)
 
             return samples
 
@@ -394,7 +373,7 @@ class ConsistencyLoss:
 
         x_start = torch.view_as_real(H_true_cplx).permute(0, 3, 1, 2).contiguous()
         dims = H_true_cplx.ndim
-        x_t = H_true_cplx + noise * self.append_dims(t, dims)
+        x_t = H_true_cplx + noise * append_dims(t, dims)
 
         
         x_t = torch.view_as_real(x_t).permute(0, 3, 1, 2).contiguous()
@@ -411,13 +390,13 @@ class ConsistencyLoss:
         distiller_target = distiller_target.detach()
 
         snrs = self.get_snr(t)
-        weights = self.get_weightings(self.weight_schedule, snrs, self.sigma_data)
+        weights = get_weightings(self.weight_schedule, snrs, self.sigma_data)
         if self.loss_norm == "l1":
             diffs = torch.abs(distiller - distiller_target)
-            loss = self.mean_flat(diffs) * weights
+            loss = mean_flat(diffs) * weights
         elif self.loss_norm == "l2":
             diffs = (distiller - distiller_target) ** 2
-            loss = self.mean_flat(diffs) * weights
+            loss = mean_flat(diffs) * weights
         elif self.loss_norm == "l2-32":
             distiller = F.interpolate(distiller, size=32, mode="bilinear")
             distiller_target = F.interpolate(
@@ -426,7 +405,7 @@ class ConsistencyLoss:
                 mode="bilinear",
             )
             diffs = (distiller - distiller_target) ** 2
-            loss = self.mean_flat(diffs) * weights
+            loss = mean_flat(diffs) * weights
         elif self.loss_norm == "lpips":
             if x_start.shape[-1] < 256:
                 distiller = F.interpolate(distiller, size=224, mode="bilinear")
@@ -519,31 +498,7 @@ class ConsistencyLoss:
         return ema_and_scales_fn
 
 
-        x0, x1 = H_true_cplx, H_true_cplx + noise
-        t = self.sample_time(batch_size, device)
-        t_b = t.view(-1, 1, 1)
-        
-        H_t_cplx = (1 - t_b) * x0 + t_b * x1
-        v_target_cplx = x1 - x0 
-        H_t_real = torch.view_as_real(H_t_cplx).permute(0, 3, 1, 2).contiguous()
-        v_target_real = torch.view_as_real(v_target_cplx).permute(0, 3, 1, 2).contiguous()
-        
-        v_pred_real = model(H_t_real, t)
-        
-        # --- 核心修改：改为代码二的聚合与加权逻辑 ---
-        error = v_pred_real - v_target_real
-        # 计算每个样本的误差范数 (聚合所有像素)
-        error_norm = torch.norm(error.reshape(batch_size, -1), dim=1)
-        unweighted_mse = torch.mean(error_norm ** 2)
 
-        if self.adaptive_p > 0:
-
-            weights = 1.0 / (error_norm.detach() ** 2 + 1e-3).pow(self.adaptive_p)
-            loss = (weights * error_norm ** 2).mean()
-        else:
-            loss = unweighted_mse
-            
-        return {'loss': loss, 'unweighted_mse': unweighted_mse}
 
 
             

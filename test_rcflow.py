@@ -11,6 +11,9 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from loaders import NpyChannelDataset1
+from random_utils import get_generator
+from karras_diffusion import KarrasDenoiser
+from karras_diffusion import karras_sample, append_dims, get_sigmas_karras, append_zero
 
 # ==========================================
 # U-Net Architecture 
@@ -116,10 +119,14 @@ class UNet(nn.Module):
                 x = module(torch.cat((x, skip), dim=1), t_emb)
             else: x = module(x)
         return self.final_conv(self.final_res_block(x, t_emb))
+    
+
+
 
 # ==========================================
 # Inference Logic
 # ==========================================
+
 
 def get_dynamic_nfe(noise_sigma, nt):
     sigma_min = (nt/1000)**0.5
@@ -130,7 +137,7 @@ def get_dynamic_nfe(noise_sigma, nt):
     nfe2 = int(N_min + ratio * (N_max - N_min))
     return 100, max(nfe2, 2)
 
-def perform_inference(model, Y_cplx, P_cplx, device, gamma, noise_scale, H_true, snr_db, args):
+def perform_flow_inference(model, Y_cplx, P_cplx, device, gamma, noise_scale, H_true, snr_db, args):
     batch_size, Nr, Np = Y_cplx.shape
     Nt = P_cplx.shape[1]
     nfe1, nfe2 = get_dynamic_nfe(noise_scale[1], Nt)
@@ -186,6 +193,8 @@ def perform_inference(model, Y_cplx, P_cplx, device, gamma, noise_scale, H_true,
 
         # print(min(nmse_list))
     # Plotting
+
+    
     min_nmse = min(nmse_list)
 
     min_idx = nmse_list.index(min_nmse)
@@ -201,17 +210,156 @@ def perform_inference(model, Y_cplx, P_cplx, device, gamma, noise_scale, H_true,
     plt.title(f"SNR {snr_db}dB")
     plt.savefig(save_dir / f"snr_{snr_db}dB_Np{args.np}_epoch{args.epoch}.pdf")
     plt.close()
+    
 
     return H_t, nfe1, nfe2
 
+def perform_consistency_inference(model, Y_cplx, P_cplx, device, gamma, noise_scale, H_true, snr_db, args):
+    batch_size, Nr, Np = Y_cplx.shape
+    Nt = P_cplx.shape[1]
+    nfe1, nfe2 = get_dynamic_nfe(noise_scale[1], Nt)
+    
+    P_H = P_cplx.mH
+    Y_P_H = torch.bmm(Y_cplx, P_H)
+    P_P_H = torch.bmm(P_cplx, P_H)
+    I_Nt = torch.eye(Nt, device=device, dtype=Y_P_H.dtype).expand(batch_size, Nt, Nt)
+    noise_scale = noise_scale.view(batch_size, 1, 1)
+    nmse_list = []
+    dt = 1.0 / (nfe2)
+    H_t = (torch.randn_like(Y_P_H) + 1j * torch.randn_like(Y_P_H)) / 2**0.5
+
+    # sampler = "multistep"
+    # sampler = "onestep"
+    sampler = "multistep_physical_constraints"
+    sigma_max=80.0
+    sigma_min=0.002
+    
+    steps = 40
+    # ts = torch.linspace(0, steps, 5)
+    # ts = 0,22,39
+    ts = torch.linspace(0, steps, 20)
+    
+    # steps = 201
+    # ts = 0,106,200
+    # ts = torch.linspace(0, steps, 3)
+    diffusion = KarrasDenoiser(
+        sigma_data=0.5,
+        sigma_max=80,
+        sigma_min=0.002,
+        distillation=False,
+        weight_schedule="karras",
+        loss_norm="l2",
+    )
+    generator = get_generator("determ", num_samples=10000)
+    H_0 = karras_sample(
+            diffusion,
+            model,
+            x_T=Y_P_H,
+            Y_P_H= Y_P_H,
+            P_P_H= P_P_H,
+            noise_scale= noise_scale,
+            # torch.randn_like(Y_P_H),
+            shape=(batch_size, 2, Nr, Nt),
+            steps=steps,
+            model_kwargs={},
+            device=device,
+            clip_denoised=None,
+            sampler=sampler,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            generator=generator,
+            ts=ts,
+        )
+    H_0 = torch.view_as_complex(H_0.permute(0, 2, 3, 1).contiguous())
+    """
+
+    for k in tqdm(range(nfe1)):
+        epsilon = Y_P_H
+        
+        # err = torch.mean(torch.sum(torch.abs(H_t - H_true)**2, dim=(-1, -2)) / torch.sum(torch.abs(H_true)**2, dim=(-1, -2)))
+        # nmse_list.append(10 * math.log10(err.item()))
+        
+        for i in range(nfe2):
+            t_curr = (1.0 - i * dt)**args.lamda 
+            t_batch = torch.full((batch_size,), t_curr, device=device)
+            
+            # 1. Flow Prediction
+            # H_t_real = torch.view_as_real(H_t).permute(0, 3, 1, 2).contiguous()
+            H_0 = karras_sample(
+            diffusion,
+            model,
+            H_t,
+            (batch_size, 2, Nr, Nt),
+            steps=40,
+            model_kwargs={},
+            device=device,
+            clip_denoised=None,
+            sampler=sampler,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            generator=generator,
+            ts=ts,
+            )
+            H0 = torch.view_as_complex(H_0.permute(0, 2, 3, 1).contiguous())
+            
+
+            
+            # 2. Physics Constraint (Likelihood)
+            vt_sq = t_curr**2 / (t_curr**2 + (1 - t_curr)**2 + 1e-6)
+            rhs = Y_P_H / noise_scale**2 + H0 / (vt_sq + 1e-6) 
+            lhs = P_P_H / noise_scale**2 + I_Nt / (vt_sq + 1e-6)
+            lhs_inv = torch.linalg.solve(lhs, I_Nt)
+            
+            H0_y = torch.bmm(rhs, lhs_inv) #+ args.gamma * kappa_t
+            
+
+            
+            # 3. Step
+            t_next = (1.0 - (i + 1)*dt)**args.beta
+            if k == 0: 
+                epsilon = (torch.randn_like(H_t) + 1j * torch.randn_like(H_t)) / 2**0.5
+                epsilon = Y_P_H
+            H_t = t_next * epsilon + (1 - t_next) * H0_y 
+    """
+
+    """
+    min_nmse = min(nmse_list)
+
+    min_idx = nmse_list.index(min_nmse)
+
+    save_dir = Path(f"./fig/eval_CDL{args.dataset}_to_CDL{args.test_dataset}_{args.scale}_Nt{args.nt}_Nr{args.nr}")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    np.save(save_dir/f"beta_{args.beta}_snr_{snr_db}.npy", nmse_list)
+    plt.figure()
+    plt.plot(nmse_list)
+    plt.text(min_idx, min_nmse,            
+        f"({min_idx+1},{min_nmse:.4f})",    
+        fontsize=10)
+    plt.title(f"SNR {snr_db}dB")
+    plt.savefig(save_dir / f"snr_{snr_db}dB_Np{args.np}_epoch{args.epoch}.pdf")
+    plt.close()
+    """
+    
+    if sampler == "multistep":
+        nfe1 = len(ts)
+        nfe2 = 1
+    elif sampler == "onestep":
+        nfe1 = 1
+        nfe2 = 1
+    elif sampler == "multistep_physical_constraints":
+        nfe1 = 100
+        nfe2 = len(ts)
+    
+    return H_0, nfe1, nfe2
+    # return H_t, nfe1, nfe2
+
 def main(args):
     # Auto Path Config
-    args.checkpoint_path = f"./results/unet_flowmt_flower_CDL_{args.dataset}_{args.scale}_Nt{args.nt}_Nr{args.nr}/ema_unet_epoch_{args.epoch}.pt"
-    args.test_file_path = f"./bin/CDL-{args.test_dataset}_Nt{args.nt}_Nr{args.nr}_ULA0.50_test.npy"
-    
+    args.checkpoint_path = f"./results/unet_flowmt_flower_CDL_{args.dataset}_{args.scale}_Nt{args.nt}_Nr{args.nr}_UPA0.5/ema_unet_epoch_{args.epoch}.pt"
+    # args.checkpoint_path = f"./results/unet_flowmt_flower_CDL_{args.dataset}_{args.scale}_Nt{args.nt}_Nr{args.nr}/ema_unet_epoch_{args.epoch}.pt"
+    args.test_file_path = f"./bin/CDL-{args.test_dataset}_Nt{args.nt}_Nr{args.nr}_UPA0.50_test.npy"
     device = torch.device(args.device)
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
-
     model = UNet(model_channels=args.model_channels, channel_mult=tuple(args.channel_mult), num_res_blocks=args.num_res_blocks).to(device)
     model.load_state_dict(torch.load(args.checkpoint_path, map_location=device))
     model.eval()
@@ -227,8 +375,8 @@ def main(args):
         all_nmse = []
         for batch in tqdm(loader, desc=f"SNR {snr}dB"):
             H_true = batch['H'].to(device)
-            H_est, n1, n2 = perform_inference(model, batch['Y'].to(device), batch['P'].to(device), device, args.gamma, batch['noise_scale'].to(device), H_true, snr, args)
-            
+            # H_est, n1, n2 = perform_flow_inference(model, batch['Y'].to(device), batch['P'].to(device), device, args.gamma, batch['noise_scale'].to(device), H_true, snr, args)
+            H_est, n1, n2 = perform_consistency_inference(model, batch['Y'].to(device), batch['P'].to(device), device, args.gamma, batch['noise_scale'].to(device), H_true, snr, args)
             nmse = torch.sum(torch.abs(H_est - H_true)**2, dim=(-1, -2)) / torch.sum(torch.abs(H_true)**2, dim=(-1, -2))
             all_nmse.extend(nmse.cpu().numpy())
             
@@ -256,3 +404,6 @@ if __name__ == "__main__":
     parser.add_argument("--lamda", type=int, default=2)
     parser.add_argument("--beta", type=int, default=2)
     main(parser.parse_args())
+
+    # python test_rcflow.py --nt 64 --nr 16 --epoch 1600 --snr_min_db -10 --snr_max_db 30 --snr_step_db 5
+    # python test_rcflow.py --nt 64 --nr 16 --epoch 2400 --snr_min_db -10 --snr_max_db 30 --snr_step_db 5
